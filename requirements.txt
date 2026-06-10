@@ -1,0 +1,8 @@
+streamlit==1.41.1
+groq==0.13.1
+pypdf==5.1.0
+python-dotenv==1.0.1
+sentence-transformers==3.3.1
+faiss-cpu==1.9.0.post1
+numpy==1.26.4
+reportlab==4.5.1
