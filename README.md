@@ -1,40 +1,93 @@
-# FinDoc AI — RAG-Based Due Diligence Copilot
+# LedgerLens — Financial Intelligence Platform
 
-A premium AI web app that analyzes company reports using RAG.
+LedgerLens is a deployed AI-powered financial document intelligence platform that helps users analyze business PDFs and generate structured due diligence reports using Retrieval-Augmented Generation (RAG).
 
-## Features
-- Upload PDF reports
-- Extract text from annual reports / investor PDFs
-- Create chunks
-- Generate embeddings using sentence-transformers/all-MiniLM-L6-v2
-- Store and retrieve using FAISS
-- Generate source-backed answers using Groq LLM
-- Display retrieved evidence with page numbers
-- Premium dark fintech dashboard
+## Live Demo
 
-## Local setup
+Live App: https://sharvarid01-ledgerlens.hf.space
+GitHub: https://github.com/Sharvarid03/LedgerLens
 
-```bash
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
+## What It Does
+
+LedgerLens allows users to upload business documents such as annual reports, audit reports, balance sheets, and investor documents. It extracts text from PDFs, creates embeddings, retrieves relevant evidence using FAISS, and generates professional reports using an LLM.
+
+The platform supports project-based uploads, user workspaces, source-backed insights, report history, editable saved reports, and downloadable PDF/TXT reports.
+
+## Key Features
+
+* User signup, login, logout, and password hashing
+* Personal workspace for each user
+* Project-based PDF uploads
+* Multi-document financial analysis
+* RAG-based report generation
+* Source-backed insights with document/page references
+* Multiple report types: Due Diligence, Financial Health, Investment Memo, Compliance Review, Risk Assessment, Custom Analysis
+* Saved report history
+* Editable saved reports
+* PDF/TXT report download
+* Review and rating system
+* Hidden admin backend
+* Pricing plan logic for Free, Pro, and Enterprise plans
+
+## Tech Stack
+
+* Python
+* Streamlit
+* FAISS
+* sentence-transformers
+* Groq LLM
+* SQLite
+* pypdf
+* ReportLab
+* Hugging Face Spaces
+* GitHub
+
+## How It Works
+
+```text
+User Login
+↓
+Create Project
+↓
+Upload Financial PDFs
+↓
+Extract and Chunk Text
+↓
+Generate Embeddings
+↓
+Retrieve Evidence using FAISS
+↓
+Generate Structured Report using LLM
+↓
+Save Report in Workspace
+↓
+Edit / Download Report
 ```
 
-Create `.env`:
+## Why It Is Different From a Normal PDF Chatbot
 
-```bash
-GROQ_API_KEY=your_key_here
-```
+A regular PDF chatbot usually gives short answers to user questions. LedgerLens is designed as a financial workflow platform. It organizes documents into projects, retrieves source-backed evidence, generates structured business reports, saves report history, and allows users to edit and download professional reports.
 
-Run:
+## Use Cases
 
-```bash
-streamlit run app.py
-```
+* Financial due diligence
+* Investment research
+* Risk assessment
+* Compliance review
+* Business document analysis
+* Analyst memo preparation
+* Internal company report review
 
-## Good test questions
-- Summarize the company in 5 bullet points.
-- What are the main risk factors?
-- What growth opportunities are mentioned?
-- Give me an executive due diligence summary.
-- Are there any red flags in the document?
+## Limitations
+
+* Public demo should be used only with public or non-confidential documents.
+* Long reports depend on LLM token limits.
+* Email delivery and payment gateway are planned future enhancements.
+* SQLite is used for MVP; production version should use PostgreSQL or Supabase.
+
+## Author
+
+Sharvari Nilesh Dhekre
+Information Technology Undergraduate
+Email: [sharvaridhekre05@gmail.com](mailto:sharvaridhekre05@gmail.com)
+LinkedIn: https://linkedin.com/in/sharvari-dhekre
