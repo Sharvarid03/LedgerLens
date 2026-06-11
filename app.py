@@ -1,9 +1,13 @@
-
 import os
 import re
 import html
+import sqlite3
+import hashlib
+import secrets
+import time
 from datetime import datetime
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
+from urllib.parse import quote
 
 import faiss
 import streamlit as st
@@ -21,6 +25,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+
 # =========================
 # APP STATE
 # =========================
@@ -28,19 +33,567 @@ if "page" not in st.session_state:
     st.session_state.page = "home"
 if "report_ready" not in st.session_state:
     st.session_state.report_ready = False
+if "auth_user" not in st.session_state:
+    st.session_state.auth_user = None
+if "active_project_id" not in st.session_state:
+    st.session_state.active_project_id = None
+if "show_help_widget" not in st.session_state:
+    st.session_state.show_help_widget = False
+if "help_bot_answer" not in st.session_state:
+    st.session_state.help_bot_answer = ""
+
+DB_PATH = os.getenv("LEDGERLENS_DB_PATH", "ledgerlens.db")
+
+# Demo admin emails: only these accounts can open the Admin DB Viewer.
+ADMIN_EMAILS = {
+    "sharvaridhekre05@gmail.com",
+    "sharvaridhekre388@gmail.com",
+    "gauridhekre@gmail.com",
+}
+
 
 def go(page: str):
     st.session_state.page = page
     st.rerun()
 
+
 def clear_report():
     for key in [
         "report_ready", "latest_question", "latest_answer", "latest_sources",
-        "latest_doc_names", "latest_metrics", "share_summary"
+        "latest_doc_names", "latest_metrics", "share_summary", "latest_report_id"
     ]:
         if key in st.session_state:
             del st.session_state[key]
     st.session_state.report_ready = False
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            plan TEXT DEFAULT 'Free',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            project_name TEXT NOT NULL,
+            project_type TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            project_id INTEGER NOT NULL,
+            file_name TEXT NOT NULL,
+            page_count INTEGER DEFAULT 0,
+            uploaded_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(project_id) REFERENCES projects(id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            project_id INTEGER,
+            report_title TEXT NOT NULL,
+            report_type TEXT NOT NULL,
+            report_text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(project_id) REFERENCES projects(id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS activity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS login_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            email TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            report_id INTEGER,
+            rating INTEGER NOT NULL,
+            review_text TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(report_id) REFERENCES reports(id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            plan TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            payment_status TEXT NOT NULL,
+            payment_method TEXT NOT NULL,
+            payment_reference TEXT,
+            activated_by TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS email_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            recipient TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            status TEXT NOT NULL,
+            message TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120000)
+    return f"pbkdf2_sha256${salt}${key.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        algorithm, salt, stored_key = stored_hash.split("$", 2)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120000)
+        return secrets.compare_digest(key.hex(), stored_key)
+    except Exception:
+        return False
+
+
+def log_activity(user_id: int, action: str):
+    conn = get_db()
+    conn.execute("INSERT INTO activity (user_id, action, created_at) VALUES (?, ?, ?)", (user_id, action, now_str()))
+    conn.commit()
+    conn.close()
+
+
+def log_login_event(user_id: int, email: str, status: str):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO login_events (user_id, email, status, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, email.strip().lower(), status, now_str()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def plan_upload_limit(plan: str) -> Optional[int]:
+    plan_normalized = (plan or "Free").strip().lower()
+    if plan_normalized == "free":
+        return 5
+    return None  # Pro and Enterprise are unlimited in this MVP.
+
+
+def plan_amount(plan: str) -> int:
+    plan_normalized = (plan or "Free").strip().lower()
+    if plan_normalized == "pro":
+        return 99
+    if plan_normalized == "enterprise":
+        return 299
+    return 0
+
+
+def update_user_plan(user_id: int, new_plan: str, activated_by: str, payment_status: str = "manual_admin_activation") -> bool:
+    allowed = {"Free", "Pro", "Enterprise"}
+    if new_plan not in allowed:
+        return False
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET plan = ? WHERE id = ?", (new_plan, int(user_id)))
+    if cur.rowcount == 0:
+        conn.close()
+        return False
+    cur.execute(
+        """
+        INSERT INTO payments (user_id, plan, amount, payment_status, payment_method, payment_reference, activated_by, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (int(user_id), new_plan, plan_amount(new_plan), payment_status, "admin_manual", f"admin-{now_str()}", activated_by, now_str()),
+    )
+    conn.commit()
+    conn.close()
+    log_activity(int(user_id), f"Plan changed to {new_plan} by admin")
+    return True
+
+
+def save_review(user_id: int, report_id: Optional[int], rating: int, review_text: str) -> int:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO reviews (user_id, report_id, rating, review_text, created_at) VALUES (?, ?, ?, ?, ?)",
+        (user_id, report_id, int(rating), review_text.strip(), now_str()),
+    )
+    conn.commit()
+    review_id = cur.lastrowid
+    conn.close()
+    log_activity(user_id, f"Submitted review rating {rating}/5")
+    return review_id
+
+
+
+def log_email_event(user_id: Optional[int], recipient: str, subject: str, status: str, message: str = ""):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO email_events (user_id, recipient, subject, status, message, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, recipient.strip().lower(), subject, status, message[:500], now_str()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def send_email_optional(user_id: Optional[int], to_email: str, subject: str, body: str) -> Tuple[bool, str]:
+    """
+    Sends real email only when SMTP secrets are configured in Hugging Face.
+    Required secrets:
+    SMTP_HOST=smtp.gmail.com
+    SMTP_PORT=587
+    SMTP_USER=your_email@gmail.com
+    SMTP_PASSWORD=your_gmail_app_password
+    """
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
+    smtp_port = int(os.getenv("SMTP_PORT", "587").strip() or "587")
+    smtp_user = os.getenv("SMTP_USER", "").strip()
+    smtp_password = os.getenv("SMTP_PASSWORD", "").strip()
+
+    if not smtp_user or not smtp_password:
+        log_email_event(user_id, to_email, subject, "prepared_not_sent", "SMTP secrets not configured")
+        return False, "SMTP not configured. Email draft/log prepared only."
+
+    try:
+        msg = EmailMessage()
+        msg["From"] = smtp_user
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.set_content(body)
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+            server.send_message(msg)
+        log_email_event(user_id, to_email, subject, "sent", "Email sent successfully")
+        return True, "Email sent successfully."
+    except Exception as exc:
+        log_email_event(user_id, to_email, subject, "failed", str(exc))
+        return False, f"Email sending failed: {exc}"
+
+
+def send_welcome_email(user_id: int, name: str, email: str):
+    subject = "Welcome to LedgerLens"
+    body = f"""Hi {name},
+
+Welcome to LedgerLens.
+
+Your private workspace is ready. You can now create projects, upload business PDFs, generate source-backed due diligence reports, and save reports in your workspace.
+
+Live app: https://sharvarid01-ledgerlens.hf.space
+
+Regards,
+LedgerLens Team
+"""
+    return send_email_optional(user_id, email, subject, body)
+
+
+def create_user(name: str, email: str, password: str) -> Tuple[bool, str]:
+    email = email.strip().lower()
+    if not name.strip() or not email or not password:
+        return False, "Please fill all fields."
+    if len(password) < 6:
+        return False, "Password should be at least 6 characters."
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO users (name, email, password_hash, plan, created_at) VALUES (?, ?, ?, ?, ?)",
+            (name.strip(), email, hash_password(password), "Free", now_str()),
+        )
+        conn.commit()
+        user_id = cur.lastrowid
+        log_activity(user_id, "Account created")
+        send_welcome_email(user_id, name.strip(), email)
+        return True, "Account created successfully. Please sign in. Welcome email is sent if SMTP is configured."
+    except sqlite3.IntegrityError:
+        return False, "This email is already registered. Please sign in."
+    finally:
+        conn.close()
+
+
+def authenticate_user(email: str, password: str) -> Tuple[bool, Optional[Dict], str]:
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE email = ?", (email.strip().lower(),)).fetchone()
+    conn.close()
+    if not row:
+        return False, None, "No account found with this email."
+    if not verify_password(password, row["password_hash"]):
+        return False, None, "Incorrect password."
+    user = {"id": row["id"], "name": row["name"], "email": row["email"], "plan": row["plan"], "created_at": row["created_at"]}
+    log_activity(user["id"], "Signed in")
+    log_login_event(user["id"], user["email"], "success")
+    return True, user, "Signed in successfully."
+
+
+def current_user() -> Optional[Dict]:
+    return st.session_state.get("auth_user")
+
+
+def is_admin(user: Optional[Dict]) -> bool:
+    return bool(user and user.get("email", "").strip().lower() in ADMIN_EMAILS)
+
+
+def require_login(target_after_login: str = "workspace"):
+    st.markdown(
+        """
+        <div class="panel">
+        <div class="panel-title">Sign in required</div>
+        <div class="panel-caption">Please sign in or create an account to access your private workspace, save projects, and view previous reports.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        if st.button("Sign In"):
+            st.session_state.after_login = target_after_login
+            go("login")
+    with c2:
+        if st.button("Create Account"):
+            st.session_state.after_login = target_after_login
+            go("signup")
+
+
+def create_project(user_id: int, project_name: str, project_type: str) -> Tuple[bool, str, Optional[int]]:
+    if not project_name.strip():
+        return False, "Project name is required.", None
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO projects (user_id, project_name, project_type, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, project_name.strip(), project_type, now_str()),
+    )
+    conn.commit()
+    project_id = cur.lastrowid
+    conn.close()
+    log_activity(user_id, f"Created project: {project_name.strip()}")
+    return True, "Project created successfully.", project_id
+
+
+def get_projects(user_id: int) -> List[Dict]:
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM projects WHERE user_id = ? ORDER BY id DESC",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_project(project_id: Optional[int]) -> Optional[Dict]:
+    if not project_id:
+        return None
+    conn = get_db()
+    row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def save_project_documents(user_id: int, project_id: int, documents: List[Dict]):
+    """Store uploaded document metadata for project history.
+    The demo does not persist raw PDF files; it stores file names/page counts for workspace tracking.
+    """
+    if not documents:
+        return
+    conn = get_db()
+    existing = {
+        row[0] for row in conn.execute(
+            "SELECT file_name FROM documents WHERE user_id = ? AND project_id = ?",
+            (user_id, project_id),
+        ).fetchall()
+    }
+    for doc in documents:
+        file_name = doc.get("file_name", "Uploaded document")
+        page_count = int(doc.get("page_count", 0) or 0)
+        if file_name not in existing:
+            conn.execute(
+                "INSERT INTO documents (user_id, project_id, file_name, page_count, uploaded_at) VALUES (?, ?, ?, ?, ?)",
+                (user_id, project_id, file_name, page_count, now_str()),
+            )
+    conn.commit()
+    conn.close()
+    log_activity(user_id, f"Uploaded {len(documents)} document(s) to project #{project_id}")
+
+
+def get_project_documents(project_id: Optional[int], user_id: Optional[int] = None) -> List[Dict]:
+    if not project_id:
+        return []
+    conn = get_db()
+    if user_id is not None:
+        rows = conn.execute(
+            "SELECT * FROM documents WHERE project_id = ? AND user_id = ? ORDER BY id DESC",
+            (project_id, user_id),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM documents WHERE project_id = ? ORDER BY id DESC",
+            (project_id,),
+        ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def save_report(user_id: int, project_id: Optional[int], report_title: str, report_type: str, report_text: str) -> int:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO reports (user_id, project_id, report_title, report_type, report_text, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, project_id, report_title, report_type, report_text, now_str()),
+    )
+    conn.commit()
+    report_id = cur.lastrowid
+    conn.close()
+    log_activity(user_id, f"Generated report: {report_title}")
+    return report_id
+
+
+
+
+def update_report(report_id: int, user_id: int, new_text: str) -> bool:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE reports SET report_text = ? WHERE id = ? AND user_id = ?",
+        (new_text, report_id, user_id),
+    )
+    conn.commit()
+    updated = cur.rowcount > 0
+    conn.close()
+    if updated:
+        log_activity(user_id, f"Edited saved report #{report_id}")
+    return updated
+
+def get_reports(user_id: int, limit: int = 50) -> List[Dict]:
+    conn = get_db()
+    rows = conn.execute(
+        """
+        SELECT reports.*, projects.project_name
+        FROM reports
+        LEFT JOIN projects ON reports.project_id = projects.id
+        WHERE reports.user_id = ?
+        ORDER BY reports.id DESC
+        LIMIT ?
+        """,
+        (user_id, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_activity(user_id: int, limit: int = 8) -> List[Dict]:
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM activity WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (user_id, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_user_stats(user_id: int) -> Dict:
+    conn = get_db()
+    projects_count = conn.execute("SELECT COUNT(*) FROM projects WHERE user_id = ?", (user_id,)).fetchone()[0]
+    reports_count = conn.execute("SELECT COUNT(*) FROM reports WHERE user_id = ?", (user_id,)).fetchone()[0]
+    documents_count = conn.execute("SELECT COUNT(*) FROM documents WHERE user_id = ?", (user_id,)).fetchone()[0]
+    conn.close()
+    return {"projects": projects_count, "reports": reports_count, "documents": documents_count}
+
+
+def get_admin_table(table_name: str, limit: int = 100) -> List[Dict]:
+    allowed_tables = {"users", "projects", "documents", "reports", "activity", "login_events", "reviews", "payments", "email_events"}
+    if table_name not in allowed_tables:
+        return []
+    conn = get_db()
+    rows = conn.execute(f"SELECT * FROM {table_name} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    conn.close()
+    clean_rows = []
+    for row in rows:
+        item = dict(row)
+        if "password_hash" in item:
+            item["password_hash"] = "hidden_for_security"
+        if "report_text" in item and item["report_text"]:
+            item["report_text"] = item["report_text"][:500] + ("..." if len(item["report_text"]) > 500 else "")
+        clean_rows.append(item)
+    return clean_rows
+
+
+def get_admin_counts() -> Dict:
+    conn = get_db()
+    counts = {}
+    for table in ["users", "projects", "documents", "reports", "activity", "login_events", "reviews", "payments", "email_events"]:
+        counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    conn.close()
+    return counts
+
+
+init_db()
 
 # =========================
 # CSS
@@ -49,7 +602,6 @@ st.markdown(
     """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
-
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 .stApp {
     background:
@@ -59,13 +611,12 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
       linear-gradient(135deg, #020617 0%, #07111f 46%, #0b1020 100%);
     color: #f8fafc;
 }
-.block-container { max-width: 1220px; padding-top: 1rem; padding-bottom: 4rem; }
+.block-container { max-width: 1220px; padding-top: 0rem; padding-bottom: 3rem; }
 [data-testid="stHeader"] { background: rgba(2,6,23,0); }
 #MainMenu, footer { visibility: hidden; }
-
 .navbar {
     position: sticky; top: 0; z-index: 999;
-    margin-bottom: 1.2rem; padding: .72rem 1rem;
+    margin-bottom: .35rem; padding: .62rem 1rem;
     border: 1px solid rgba(148,163,184,.18); border-radius: 999px;
     background: rgba(2,6,23,.72); backdrop-filter: blur(18px);
     display: flex; align-items: center; justify-content: space-between;
@@ -73,10 +624,10 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 }
 .nav-brand { font-weight: 950; letter-spacing: -.04em; font-size: 1.08rem; color: white; }
 .nav-mini { color: #94a3b8; font-size: .84rem; font-weight: 700; }
-
+div[data-testid="stHorizontalBlock"]:has(button[kind="secondary"]) { gap: .35rem; }
 .hero {
-    min-height: 64vh; display: grid; grid-template-columns: .98fr 1.02fr;
-    gap: 2.4rem; align-items: center; padding: 2rem 0 2.4rem;
+    min-height: 46vh; display: grid; grid-template-columns: .98fr 1.02fr;
+    gap: 1.7rem; align-items: center; padding: .25rem 0 1.15rem;
 }
 .eyebrow {
     display: inline-flex; padding: .44rem .76rem; border-radius: 999px;
@@ -85,11 +636,11 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     text-transform: uppercase; animation: fadeUp .8s ease both;
 }
 .logo-pop {
-    margin-top: 1rem; font-size: clamp(3rem, 6vw, 5.4rem); line-height: .92;
+    margin-top: .35rem; font-size: clamp(2.65rem, 5.2vw, 4.8rem); line-height: .92;
     font-weight: 950; letter-spacing: -.09em; color: white; animation: logoPop 1.2s ease both;
 }
 .hero-title {
-    margin-top: .55rem; max-width: 690px; font-size: clamp(1.85rem, 3.2vw, 3.25rem);
+    margin-top: .35rem; max-width: 690px; font-size: clamp(1.7rem, 2.85vw, 2.85rem);
     line-height: 1.05; font-weight: 900; letter-spacing: -.06em; color: white; animation: fadeUp 1s ease both;
 }
 .gradient-text {
@@ -97,12 +648,12 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     -webkit-background-clip: text; -webkit-text-fill-color: transparent;
 }
 .hero-subtitle {
-    margin-top: 1.05rem; max-width: 680px; color: #cbd5e1; font-size: 1rem;
+    margin-top: .75rem; max-width: 680px; color: #cbd5e1; font-size: .96rem;
     line-height: 1.72; animation: fadeUp 1.1s ease both;
 }
-.hero-visual { position: relative; min-height: 380px; animation: fadeIn 1.3s ease both; }
+.hero-visual { position: relative; min-height: 310px; animation: fadeIn 1.3s ease both; }
 .blob {
-    position: absolute; right: 40px; top: 30px; width: 310px; height: 310px;
+    position: absolute; right: 40px; top: -5px; width: 275px; height: 275px;
     border-radius: 38% 62% 64% 36% / 40% 45% 55% 60%;
     background:
       radial-gradient(circle at 30% 25%, #4ade80, transparent 20%),
@@ -117,19 +668,17 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     border: 1px solid rgba(148,163,184,.23); box-shadow: 0 24px 80px rgba(0,0,0,.36);
     backdrop-filter: blur(20px);
 }
-.terminal { width: 88%; right: 0; top: 10%; min-height: 220px; }
+.terminal { width: 88%; right: 0; top: 0%; min-height: 200px; }
 .term-line { color: #cbd5e1; font-family: ui-monospace, Consolas, monospace; font-size: .82rem; padding: .30rem 0; }
 .dot { width: 10px; height: 10px; border-radius: 999px; display: inline-block; margin-right: .32rem; }
 .r { background: #fb7185; } .y { background: #fbbf24; } .g { background: #34d399; }
-.mini-left { width: 46%; left: 0; bottom: 12%; animation: floaty 5s ease-in-out infinite; }
+.mini-left { width: 46%; left: 0; bottom: 8%; animation: floaty 5s ease-in-out infinite; }
 .mini-right { width: 39%; right: 5%; bottom: 0; animation: floaty 6s ease-in-out infinite reverse; }
 .big { font-size: 2.1rem; font-weight: 950; letter-spacing: -.06em; color: white; }
 .tiny { color: #94a3b8; font-size: .72rem; font-weight: 850; text-transform: uppercase; letter-spacing: .06em; }
-
-.section { padding: 2.35rem 0 1rem; }
+.section { padding: 1.6rem 0 .8rem; }
 .section-title { font-size: clamp(1.8rem, 3.2vw, 2.65rem); line-height: 1.08; font-weight: 950; letter-spacing: -.06em; color: white; margin-bottom: .65rem; }
 .section-sub { color: #cbd5e1; font-size: .98rem; line-height: 1.72; max-width: 900px; margin-bottom: 1.25rem; }
-
 .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: .9rem; }
 .grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: .9rem; }
 .card, .panel, .report-card, .share-box, .pricing, .security-box, .contact-card {
@@ -142,7 +691,6 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 .card-title, .panel-title { font-weight: 950; color: white; font-size: 1.02rem; margin-bottom: .38rem; }
 .card-text, .panel-caption { color: #94a3b8; font-size: .88rem; line-height: 1.58; }
 .icon { font-size: 1.42rem; margin-bottom: .65rem; }
-
 .shell {
     border-radius: 30px; background: rgba(15,23,42,.66);
     border: 1px solid rgba(148,163,184,.20); box-shadow: 0 26px 90px rgba(0,0,0,.36);
@@ -155,7 +703,6 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 }
 .metric-label { color: #94a3b8; font-size: .72rem; font-weight: 850; letter-spacing: .05em; text-transform: uppercase; }
 .metric-value { color: white; font-size: 1.36rem; font-weight: 950; margin-top: .2rem; letter-spacing: -.04em; }
-
 .privacy-note {
     padding: .95rem; border-radius: 17px; background: rgba(251,191,36,.08);
     border: 1px solid rgba(251,191,36,.25); color: #fde68a; font-size: .86rem; line-height: 1.55;
@@ -193,14 +740,12 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 .workflow { display: grid; grid-template-columns: repeat(5, 1fr); gap: .75rem; }
 .step { padding: 1rem; border-radius: 22px; background: rgba(2,6,23,.5); border: 1px solid rgba(148,163,184,.18); }
 .num { width: 31px; height: 31px; border-radius: 999px; display: grid; place-items: center; background: linear-gradient(135deg,#22c55e,#2563eb); font-weight: 950; margin-bottom: .7rem; }
-
 .price-name { font-size: 1.16rem; font-weight: 950; color: white; }
 .price { font-size: 1.95rem; font-weight: 950; letter-spacing: -.06em; margin: .7rem 0; color: white; }
 .price span { font-size: .86rem; color: #94a3b8; letter-spacing: 0; }
 .check { color: #cbd5e1; margin: .5rem 0; font-size: .9rem; }
 .pricing { padding: 1.25rem; min-height: 300px; }
 .popular { border-color: rgba(74,222,128,.5); box-shadow: 0 28px 90px rgba(34,197,94,.12); }
-
 .contact-card, .security-box { padding: 1.35rem; }
 .contact-btn {
     display: inline-block; margin-top: .9rem; text-decoration: none; padding: .8rem 1rem;
@@ -208,7 +753,71 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 }
 .share-box { padding: 1.2rem; }
 .footer { text-align: center; padding: 2rem 0 .5rem; color: #94a3b8; font-size: .84rem; }
+.floating-help-icon {
+    position: fixed;
+    right: 24px;
+    bottom: 24px;
+    width: 58px;
+    height: 58px;
+    border-radius: 999px;
+    background: linear-gradient(135deg,#22c55e,#2563eb);
+    color: white !important;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.65rem;
+    text-decoration: none !important;
+    box-shadow: 0 18px 60px rgba(37,99,235,.42);
+    border: 1px solid rgba(255,255,255,.24);
+    z-index: 99999;
+}
+.help-drawer {
+    position: fixed;
+    right: 24px;
+    bottom: 96px;
+    width: min(390px, calc(100vw - 48px));
+    max-height: 74vh;
+    overflow-y: auto;
+    padding: 1.05rem;
+    border-radius: 24px;
+    background: rgba(2,6,23,.96);
+    border: 1px solid rgba(74,222,128,.28);
+    box-shadow: 0 28px 90px rgba(0,0,0,.55);
+    z-index: 99998;
+}
+.help-drawer-title { color: white; font-size: 1.08rem; font-weight: 950; margin-bottom: .35rem; }
+.help-drawer-text { color: #cbd5e1; font-size: .86rem; line-height: 1.55; }
+.help-chip {
+    display: inline-block;
+    margin: .22rem .18rem .22rem 0;
+    padding: .35rem .55rem;
+    border-radius: 999px;
+    background: rgba(34,197,94,.12);
+    border: 1px solid rgba(74,222,128,.22);
+    color: #bbf7d0;
+    font-size: .78rem;
+    font-weight: 800;
+}
+.close-help {
+    float: right;
+    color: #93c5fd !important;
+    text-decoration: none !important;
+    font-weight: 900;
+}
 
+.floating-help {
+    position: fixed; right: 22px; bottom: 24px; z-index: 9999;
+    padding: .85rem 1rem; border-radius: 999px; color: white!important;
+    background: linear-gradient(135deg,#22c55e,#2563eb); text-decoration: none!important;
+    font-weight: 950; box-shadow: 0 18px 55px rgba(37,99,235,.35);
+    border: 1px solid rgba(255,255,255,.18);
+}
+.floating-help:hover { transform: translateY(-2px); }
+.rating-card { padding: 1.15rem; border-radius: 22px; background: rgba(15,23,42,.72); border: 1px solid rgba(74,222,128,.25); }
+
+/* Reduce Streamlit default top whitespace on deployed app */
+section.main > div { padding-top: 0rem !important; }
+[data-testid="stAppViewContainer"] > .main { padding-top: 0rem !important; }
 /* Removes accidental empty Streamlit spacer bars */
 div[data-testid="stMarkdownContainer"]:empty {
     display: none !important;
@@ -216,7 +825,6 @@ div[data-testid="stMarkdownContainer"]:empty {
 .element-container:has(div[data-testid="stMarkdownContainer"]:empty) {
     display: none !important;
 }
-
 .review-card {
     padding: 1.15rem;
     border-radius: 22px;
@@ -260,11 +868,10 @@ div[data-testid="stMarkdownContainer"]:empty {
     font-weight: 950;
     cursor: pointer;
 }
-
 .stButton > button {
-    width: 100%; border-radius: 15px; border: 0;
+    width: auto; min-width: 145px; border-radius: 999px; border: 0;
     background: linear-gradient(135deg,#22c55e,#2563eb)!important;
-    color: white!important; font-weight: 950; padding: .78rem .9rem;
+    color: white!important; font-weight: 950; padding: .66rem 1rem;
 }
 .stDownloadButton > button {
     width: 100%; border-radius: 15px; border: 0;
@@ -277,6 +884,32 @@ div[data-testid="stMarkdownContainer"]:empty {
 }
 div[data-testid="stFileUploader"] {
     border: 1px dashed rgba(74,222,128,.55); border-radius: 20px; padding: .9rem; background: rgba(2,6,23,.34);
+}
+
+/* Hide Streamlit's default 'Press Enter to submit form' helper text */
+div[data-testid="InputInstructions"],
+.stTextInput div[data-testid="InputInstructions"],
+.stTextArea div[data-testid="InputInstructions"] {
+    display: none !important;
+    visibility: hidden !important;
+    height: 0 !important;
+}
+
+/* Make support action buttons clearly visible */
+.contact-btn,
+.contact-btn:visited,
+.contact-btn:active {
+    color: #ffffff !important;
+    text-decoration: none !important;
+}
+.contact-btn:hover {
+    filter: brightness(1.12);
+    transform: translateY(-1px);
+}
+.email-btn {
+    margin-left: .7rem;
+    background: linear-gradient(135deg,#7c3aed,#2563eb) !important;
+    box-shadow: 0 12px 30px rgba(37,99,235,.22);
 }
 
 @keyframes logoPop {
@@ -293,7 +926,7 @@ div[data-testid="stFileUploader"] {
 }
 @media(max-width:1050px) {
     .hero { grid-template-columns: 1fr; min-height: auto; }
-    .hero-visual { min-height: 390px; }
+    .hero-visual { min-height: 310px; }
     .grid4,.grid3,.workflow { grid-template-columns: repeat(2,1fr); }
 }
 @media(max-width:680px) {
@@ -304,6 +937,7 @@ div[data-testid="stFileUploader"] {
 """,
     unsafe_allow_html=True,
 )
+
 
 # =========================
 # RAG FUNCTIONS
@@ -361,113 +995,223 @@ def retrieve_relevant_chunks(question: str, chunks: List[Dict], index, top_k: in
             results.append(item)
     return results
 
-def call_groq(prompt: str) -> str:
+def compact_text(text: str, max_chars: int = 950) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rsplit(" ", 1)[0] + " ..."
+
+def call_groq(prompt: str, max_tokens: int = 1800) -> str:
     api_key = get_api_key()
     if not api_key:
         return (
-            "Groq API key is missing. Add this line in your .env file:\n\n"
-            "GROQ_API_KEY=gsk_your_actual_key_here\n\n"
-            "Then save .env, stop Streamlit with Ctrl+C, and run streamlit run app.py again."
+            "Groq API key is missing. Add GROQ_API_KEY in Hugging Face secrets or local .env. "
+            "Your document upload and retrieval pipeline are working, but report generation needs the key."
         )
 
-    client = Groq(api_key=api_key)
-    response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are LedgerLens, a professional business due diligence analyst. "
-                    "Write like a human analyst preparing an internal business review. "
-                    "Do not use chatbot language. Do not say 'as an AI'. "
-                    "Use only retrieved evidence. Cite document names and page numbers."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.12,
-    )
-    return response.choices[0].message.content
+    # Groq free/on-demand tier has a low tokens-per-minute limit.
+    # Keep prompt + answer under that limit so the app does not crash.
+    safe_prompt = prompt
+    if len(safe_prompt) > 11500:
+        safe_prompt = safe_prompt[:11500].rsplit(" ", 1)[0] + "\n\n[Context shortened automatically to stay within API token limits.]"
 
-def ask_groq(question: str, context_chunks: List[Dict], mode: str = "standard") -> str:
-    context = "\n\n".join(
+    client = Groq(api_key=api_key)
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are LedgerLens, a professional business due diligence analyst. "
+                        "Write concise, evidence-backed business reports. "
+                        "Do not use chatbot language. Do not say 'as an AI'. "
+                        "Use only retrieved evidence. Every key finding must cite document name and page number."
+                    ),
+                },
+                {"role": "user", "content": safe_prompt},
+            ],
+            temperature=0.12,
+            max_tokens=max_tokens,
+        )
+        return response.choices[0].message.content
+    except Exception as exc:
+        msg = str(exc)
+        if "rate_limit" in msg.lower() or "Request too large" in msg or "tokens per minute" in msg:
+            return (
+                "LedgerLens could not generate the report because the current Groq free/on-demand token limit was exceeded.\n\n"
+                "What to do now:\n"
+                "- Choose Executive report depth.\n"
+                "- Use 10 pages or a smaller custom page target.\n"
+                "- Upload fewer/smaller PDFs for this run.\n"
+                "- Try again after 60 seconds.\n\n"
+                "The app has handled the error safely; your document upload and retrieval steps are still working."
+            )
+        return f"Report generation failed safely: {msg[:700]}"
+
+def make_source_context(chunks: List[Dict], max_chars: int = 700) -> str:
+    """Build a compact evidence pack with document and page citations."""
+    return "\n\n".join(
         [
-            f"Source {i + 1} | Document: {chunk['doc']} | Page {chunk['page']}:\n{chunk['text']}"
-            for i, chunk in enumerate(context_chunks)
+            f"Evidence {i + 1} | Document: {chunk['doc']} | Page {chunk['page']} | Similarity: {chunk.get('score', 0):.2f}\n{compact_text(chunk['text'], max_chars)}"
+            for i, chunk in enumerate(chunks)
         ]
     )
 
-    report_structure = """
-Prepare the output as a formal internal business report. The report must look like it was prepared by a business analyst, not like a chatbot answer.
+def section_prompt(section_title: str, final_question: str, context: str, audience: str, report_depth: str, target_pages_value: str) -> str:
+    return f"""
+You are preparing one section of a professional LedgerLens financial intelligence report.
 
-Use this exact structure:
+Report request:
+{final_question}
 
-1. Review Snapshot
-Documents Reviewed:
-Report Type:
-Risk Level:
-Key Business Theme:
-Evidence Count:
+Current section to write:
+{section_title}
 
-2. Executive Summary
-Write one short professional paragraph of 5 to 7 lines. Avoid generic filler.
+Audience:
+{audience}
 
-3. Key Findings
-Use short hyphen bullets. Each point must be supported by retrieved evidence.
+Depth:
+{report_depth}
 
-4. Risk and Red Flag Review
-For each risk, write:
-Risk Area:
-Why It Matters:
-Possible Business Impact:
-Source:
+Target report size selected by user:
+{target_pages_value}
 
-5. Financial and Operational Signals
-Mention revenue, cost, cash flow, operating model, strategy, or market indicators only if present in the retrieved evidence.
-
-6. Growth Opportunities
-Mention opportunity themes only if supported by the retrieved evidence.
-
-7. Recommended Follow-Up Questions
-Write practical questions that company employees, analysts, auditors, or managers can ask next.
-
-8. Source Evidence Summary
-Use short source lines in this format:
-Document name - Page number - Evidence summary - Relevance
-
-9. Final Analyst Note
-Give a short final conclusion.
-
-Strict writing rules:
-- Plain text only.
-- Do not use Markdown tables.
-- Do not use pipe symbols.
-- Do not use asterisks, emojis, or decorative bullets.
-- Use normal hyphen bullets only.
-- Do not write 'as an AI model'.
-- Do not write 'based on the provided context'.
-- Do not invent missing information.
-- If information is missing, write 'Not identified in the retrieved document evidence.'
-- Keep the tone professional, concise, workplace-ready, and useful for company employees.
-"""
-
-    if mode == "risk":
-        report_structure += "\nFocus more deeply on risks, red flags, severity, and business impact."
-    elif mode == "growth":
-        report_structure += "\nFocus more deeply on growth opportunities, expansion signals, and execution risks."
-    elif mode == "compare":
-        report_structure += "\nCompare the uploaded documents and clearly separate document-wise observations."
-
-    prompt = f"""
-User due diligence request:
-{question}
-
-Retrieved source evidence:
+Retrieved evidence for this section:
 {context}
 
-{report_structure}
+Write only this section.
+Rules:
+- Write in a professional analyst tone, not chatbot tone.
+- Use only the evidence provided.
+- Do not invent figures, dates, revenue values, ratios, or facts.
+- Every important finding must end with an inline citation: (Source: Document_Name.pdf, Page X).
+- If a topic is not identified in evidence, write: Not identified in the retrieved document evidence.
+- Use clear headings and short paragraphs.
+- Use clean bullets where useful.
+- Do not use markdown tables, pipe symbols, emojis, or decorative formatting.
+- Make the section detailed enough to be useful in a downloadable business report.
 """
-    return call_groq(prompt)
+
+def deterministic_evidence_register(sources: List[Dict]) -> str:
+    lines = ["\n10. Source Evidence Register", "This register lists the evidence retrieved and used by the LedgerLens report engine."]
+    seen = set()
+    for i, src in enumerate(sources, start=1):
+        key = (src.get('doc'), src.get('page'), compact_text(src.get('text', ''), 120))
+        if key in seen:
+            continue
+        seen.add(key)
+        excerpt = compact_text(src.get('text', ''), 260)
+        lines.append(f"- Evidence {i}: {src.get('doc')} - Page {src.get('page')} - {excerpt}")
+    return "\n".join(lines)
+
+def generate_sectioned_report(
+    final_question: str,
+    all_chunks: List[Dict],
+    index,
+    review_type: str,
+    report_depth: str,
+    target_pages_value: str,
+    audience: str,
+    mode: str = "standard",
+) -> Tuple[str, List[Dict]]:
+    """Generate a serious report section-by-section instead of one huge prompt.
+    This makes the report more detailed and avoids Groq token-limit crashes.
+    """
+    base_sections = [
+        "1. Executive Summary",
+        "2. Documents Reviewed and Scope of Analysis",
+        "3. Business Overview and Operating Context",
+        "4. Financial Health and Operating Signals",
+        "5. Key Risks and Red Flags",
+        "6. Compliance, Governance, and Control Concerns",
+        "7. Growth Opportunities and Strategic Upside",
+        "8. Investment Memo and Decision Considerations",
+        "9. Recommended Follow-Up Questions",
+    ]
+
+    if report_depth == "Executive":
+        sections = [base_sections[i] for i in [0, 1, 3, 4, 8]]
+        max_tokens = 650
+        context_chars = 520
+    elif report_depth == "Standard":
+        sections = [base_sections[i] for i in [0, 1, 2, 3, 4, 6, 8]]
+        max_tokens = 850
+        context_chars = 620
+    else:
+        sections = base_sections
+        max_tokens = 1050
+        context_chars = 700
+
+    # For special report types, keep all core sections but bias retrieval and writing.
+    type_guidance = {
+        "Due Diligence": "full due diligence review",
+        "Financial Health": "financial health, liquidity, revenue, costs, operating performance",
+        "Investment Memo": "investment thesis, risks, upside, decision factors",
+        "Compliance Review": "compliance, governance, audit, controls, disclosures",
+        "Risk Assessment": "risks, red flags, severity, downside exposure",
+        "Custom Analysis": "custom user request",
+    }.get(review_type, review_type)
+
+    report_parts = [
+        "LedgerLens Professional Financial Intelligence Report",
+        f"Report Type: {review_type}",
+        f"Audience: {audience}",
+        f"Report Depth: {report_depth}",
+        f"Target Length Selected: {target_pages_value}",
+        "Generation Method: Section-by-section RAG with source citations",
+        "",
+        "Visual Executive Dashboard",
+        "- Risk snapshot: Generated from document-level risk signals and retrieved evidence.",
+        "- Evidence model: Each section is generated from semantically retrieved document chunks.",
+        "- Citation rule: Every major finding is expected to include document name and page number.",
+        "",
+    ]
+
+    collected_sources: List[Dict] = []
+    progress = st.progress(0, text="Starting LedgerLens report engine...")
+
+    for idx, title in enumerate(sections, start=1):
+        progress.progress((idx - 1) / max(len(sections), 1), text=f"Generating {title}...")
+        section_query = f"{final_question} | {type_guidance} | {title}"
+        # Fewer, tighter chunks per section. Different query per section creates better targeted evidence.
+        section_chunks = retrieve_relevant_chunks(section_query, all_chunks, index, top_k=4)
+        collected_sources.extend(section_chunks)
+        context = make_source_context(section_chunks, max_chars=context_chars)
+        prompt = section_prompt(title, final_question, context, audience, report_depth, target_pages_value)
+        section_text = call_groq(prompt, max_tokens=max_tokens)
+        report_parts.append(section_text.strip())
+        report_parts.append("\n")
+        # Avoid Groq TPM spikes on the free/on-demand tier for longer reports.
+        if idx < len(sections):
+            time.sleep(3)
+
+    progress.progress(1.0, text="Finalizing citations and evidence register...")
+    report_parts.append(deterministic_evidence_register(collected_sources[:18]))
+    report_parts.append("\nFinal note: This report is generated for decision-support and internal review. It is not financial advice. Confidential business files should be processed only in a private deployment.")
+    progress.empty()
+
+    # De-duplicate sources while preserving order.
+    deduped = []
+    seen = set()
+    for src in collected_sources:
+        key = (src.get('doc'), src.get('page'), compact_text(src.get('text', ''), 140))
+        if key not in seen:
+            deduped.append(src)
+            seen.add(key)
+    return "\n".join(report_parts), deduped[:18]
+
+def ask_groq(question: str, context_chunks: List[Dict], mode: str = "standard") -> str:
+    # Backward-compatible simple answer function. The main report generator now uses generate_sectioned_report().
+    context = make_source_context(context_chunks[:4], max_chars=650)
+    prompt = f"""
+Prepare a concise professional answer using the retrieved evidence.
+Question: {question}
+Evidence:
+{context}
+Rules: cite every major finding with (Source: Document_Name.pdf, Page X). Do not invent facts.
+"""
+    return call_groq(prompt, max_tokens=900)
 
 def estimate_risk_signal(text: str) -> Tuple[str, int]:
     risk_words = [
@@ -518,19 +1262,14 @@ def build_txt_report(question: str, answer: str, sources: List[Dict], doc_names:
     docs = "\n".join("- " + name for name in doc_names)
     return f"""LedgerLens Business Due Diligence Report
 Generated on: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-
 Documents Reviewed:
 {docs}
-
 Review Request:
 {question}
-
 Professional Analysis:
 {answer}
-
 Retrieved Source Evidence:
 {source_text}
-
 Report Note:
 This report is generated by LedgerLens for decision-support and internal business review purposes.
 It is not financial advice. For confidential company documents, use private deployment with controlled
@@ -870,40 +1609,82 @@ def reset_report():
             del st.session_state[key]
     st.session_state.report_ready = False
 
+
+
 # =========================
 # UI HELPERS
 # =========================
 def render_nav():
+    user = current_user()
     st.markdown(
-        """
+        f"""
 <div class="navbar">
     <div class="nav-brand">💼 LedgerLens</div>
-    <div class="nav-mini">RAG-powered due diligence workspace</div>
+    <div class="nav-mini">{'Signed in as ' + html.escape(user['name']) if user else 'RAG-powered due diligence workspace'}</div>
 </div>
 """,
         unsafe_allow_html=True,
     )
+    if user:
+        # Clean user navbar. Admin backend is never shown here.
+        c1, c2, c3, c4, c5 = st.columns([1, 1.15, 1, 1, 1])
+        with c1:
+            if st.button("Home"):
+                go("home")
+        with c2:
+            if st.button("Workspace"):
+                go("workspace")
+        with c3:
+            if st.button("Reports"):
+                go("reports")
+        with c4:
+            if st.button("Account"):
+                go("account")
+        with c5:
+            if st.button("Logout"):
+                log_activity(user["id"], "Logged out")
+                st.session_state.auth_user = None
+                st.session_state.active_project_id = None
+                clear_report()
+                go("home")
+    else:
+        c1, c2, c3, c4, c5, c6 = st.columns([1, 1, 1, 1, 1, 1])
+        with c1:
+            if st.button("Home"):
+                go("home")
+        with c2:
+            if st.button("Security"):
+                go("security")
+        with c3:
+            if st.button("Pricing"):
+                go("plans")
+        with c4:
+            if st.button("Workspace"):
+                st.session_state.after_login = "workspace"
+                go("login")
+        with c5:
+            if st.button("Sign In"):
+                go("login")
+        with c6:
+            if st.button("Sign Up"):
+                go("signup")
 
 def render_footer():
     st.markdown(
         """
 <section class="section">
 <div class="section-title">What early users say.</div>
-
-
 <div class="grid3">
 <div class="review-card">
 <div class="card-text">“LedgerLens made the report review process much easier. The source evidence helped me quickly understand where each finding came from.”</div>
 <div class="review-name">Aarav Mehta</div>
 <div class="review-role">Finance Analyst, Mumbai</div>
 </div>
-
 <div class="review-card">
 <div class="card-text">“The risk and red flag sections are useful for preparing internal discussion points before a client or vendor review.”</div>
 <div class="review-name">Priya Nair</div>
 <div class="review-role">Business Consultant, Bengaluru</div>
 </div>
-
 <div class="review-card">
 <div class="card-text">“The dashboard feels more structured than a normal PDF chatbot because it turns documents into a proper due diligence report.”</div>
 <div class="review-name">Rohan Kulkarni</div>
@@ -911,7 +1692,6 @@ def render_footer():
 </div>
 </div>
 </section>
-
 <section class="section">
 <div class="contact-card">
 <div class="card-title">Contact Support</div>
@@ -920,20 +1700,18 @@ Have a query, feedback, or deployment issue? Fill the form below or email:
 <br><br>
 <b style="color:white;">sharvaridhekre05@gmail.com</b>
 </div>
-
 <form class="query-form" action="https://formsubmit.co/sharvaridhekre05@gmail.com" method="POST">
 <input type="hidden" name="_subject" value="New LedgerLens Query">
 <input type="hidden" name="_captcha" value="false">
 <input type="text" name="name" placeholder="Your name" required>
 <input type="email" name="email" placeholder="Your email" required>
 <textarea name="message" rows="5" placeholder="Write your query here..." required></textarea>
-<button type="submit">Send Query</button>
+<button type="submit">Send Query to Support</button>
 </form>
-
-<a class="contact-btn" href="mailto:sharvaridhekre05@gmail.com?subject=LedgerLens%20Query">Open Email App</a>
+<a class="contact-btn email-btn" href="mailto:sharvaridhekre05@gmail.com?subject=LedgerLens%20Query">Open Email App</a>
+<div class="card-text" style="margin-top:.8rem;">Note: the support form uses FormSubmit. On the first submission, FormSubmit may send a one-time activation email to the support inbox.</div>
 </div>
 </section>
-
 <div class="footer">
 LedgerLens is a business document intelligence MVP built for learning and portfolio demonstration.
 This public demo is not financial advice and should be used only with public or non-confidential documents.
@@ -942,6 +1720,8 @@ For confidential company use, deploy privately with secure infrastructure.
 """,
         unsafe_allow_html=True,
     )
+
+
 
 # =========================
 # SCREENS
@@ -955,27 +1735,26 @@ def render_home():
 <div class="eyebrow">Secure Business Document Intelligence</div>
 <div class="logo-pop">LedgerLens</div>
 <div class="hero-title">
-Business due diligence powered by <span class="gradient-text">source-backed retrieval.</span>
+Enterprise financial intelligence powered by <span class="gradient-text">source-backed retrieval.</span>
 </div>
 <div class="hero-subtitle">
-LedgerLens is a RAG-based platform that reviews business documents, retrieves evidence, and produces professional due diligence reports for internal business use.
+LedgerLens is a RAG-based platform that reviews business documents, retrieves evidence, and produces professional due diligence reports inside a secure user workspace.
 </div>
 </div>
-
 <div class="hero-visual">
 <div class="blob"></div>
 <div class="float-card terminal">
 <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-<div class="term-line">evidence-first document review</div>
-<div class="term-line">multi-document due diligence flow</div>
-<div class="term-line">risk, red flag, and growth analysis</div>
-<div class="term-line">professional report dashboard</div>
-<div class="term-line">downloadable business-ready output</div>
+<div class="term-line">secure login and private workspace</div>
+<div class="term-line">project-based document review</div>
+<div class="term-line">source-backed due diligence reports</div>
+<div class="term-line">report history and export</div>
+<div class="term-line">privacy-aware business workflow</div>
 </div>
 <div class="float-card mini-left">
-<div class="tiny">For Teams</div>
-<div class="big">Review</div>
-<div style="color:#cbd5e1;">Helps employees convert long reports into clear business actions.</div>
+<div class="tiny">Workspace</div>
+<div class="big">Private</div>
+<div style="color:#cbd5e1;">Users create projects and save reports in their own workspace.</div>
 </div>
 <div class="float-card mini-right">
 <div class="tiny">RAG Core</div>
@@ -991,186 +1770,389 @@ LedgerLens is a RAG-based platform that reviews business documents, retrieves ev
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
         if st.button("Start Document Review"):
-            go("workspace")
+            if current_user():
+                go("workspace")
+            else:
+                st.session_state.after_login = "workspace"
+                go("login")
     with c2:
+        if st.button("Create Free Account"):
+            go("signup")
+    with c3:
         if st.button("View Security Approach"):
             go("security")
-    with c3:
-        if st.button("View Product Plans"):
-            go("plans")
 
     st.markdown(
         """
 <section class="section">
-<div class="section-title">Why choose LedgerLens?</div>
+<div class="section-title">Why LedgerLens is more than a PDF chatbot.</div>
 <div class="section-sub">
-It is not a generic PDF chatbot. LedgerLens follows a due diligence workflow: upload documents, select review type, retrieve evidence, generate a structured report, and export it for business use.
+LedgerLens combines authentication, user workspaces, project-based document uploads, vector search, source-backed answers, report history, and downloadable business reports. It is built like a financial intelligence platform, not just a chat window.
 </div>
 <div class="grid3">
-<div class="card"><div class="icon">📌</div><div class="card-title">Evidence-first retrieval</div><div class="card-text">Uses semantic search to retrieve relevant document sections before generating the report.</div></div>
-<div class="card"><div class="icon">💼</div><div class="card-title">Workplace-ready reports</div><div class="card-text">Produces formal reports with findings, risks, follow-up questions, and source evidence.</div></div>
-<div class="card"><div class="icon">📄</div><div class="card-title">Export and share</div><div class="card-text">Download PDF/TXT reports and share summary outputs for review discussions.</div></div>
+<div class="card"><div class="icon">🔐</div><div class="card-title">Secure workspace flow</div><div class="card-text">Users sign in, create projects, and keep generated reports in their own workspace.</div></div>
+<div class="card"><div class="icon">📌</div><div class="card-title">Evidence-first retrieval</div><div class="card-text">Uses embeddings and FAISS to retrieve relevant document sections before generating the report.</div></div>
+<div class="card"><div class="icon">💼</div><div class="card-title">Business-ready reports</div><div class="card-text">Produces due diligence outputs with risks, findings, follow-up questions, and source evidence.</div></div>
 </div>
 </section>
 """,
         unsafe_allow_html=True,
     )
 
-def render_workspace():
+
+def render_signup():
     render_nav()
-    top1, top2 = st.columns([0.18, 0.82])
-    with top1:
-        if st.button("← Home"):
-            go("home")
-    with top2:
-        st.markdown("### Document Review Workspace")
-    st.markdown('<div class="section-sub">Upload public or non-confidential business documents, choose a review type, and generate a professional report.</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="shell">', unsafe_allow_html=True)
-    left_col, right_col = st.columns([0.36, 0.64], gap="large")
-
-    with left_col:
+    st.markdown('<section class="section"><div class="section-title">Create your LedgerLens account.</div><div class="section-sub">Sign up to access your private workspace, projects, and report history.</div></section>', unsafe_allow_html=True)
+    left, right = st.columns([0.52, 0.48], gap="large")
+    with left:
+        with st.form("signup_form"):
+            name = st.text_input("Full name")
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            confirm = st.text_input("Confirm password", type="password")
+            submitted = st.form_submit_button("Create Account")
+            if submitted:
+                if password != confirm:
+                    st.error("Passwords do not match.")
+                else:
+                    ok, msg = create_user(name, email, password)
+                    if ok:
+                        st.success(msg)
+                        st.info("Now sign in using your email and password.")
+                    else:
+                        st.error(msg)
+        if st.button("Already have an account? Sign In"):
+            go("login")
+    with right:
         st.markdown(
             """
-<div class="panel">
-<div class="panel-title">1. Upload Safety Confirmation</div>
-<div class="panel-caption">This public demo is intended for public or non-confidential documents only.</div>
-<div class="privacy-note">Do not upload confidential company data, personal data, trade secrets, legal documents, or restricted internal files in this public demo.</div>
+<div class="security-box">
+<div class="card-title">What your account enables</div>
+<div class="card-text">
+✅ Personal workspace<br>
+✅ Project-based document review<br>
+✅ Saved report history<br>
+✅ Password hashing<br>
+✅ User-isolated projects and reports<br><br>
+Public demo note: Use only public or non-confidential files.
+</div>
 </div>
 """,
             unsafe_allow_html=True,
         )
-        safe_to_upload = st.checkbox("I confirm these documents are public or non-confidential and suitable for demo processing.")
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown('<div class="panel"><div class="panel-title">2. Upload Documents</div><div class="panel-caption">Upload business PDFs for review. Free demo limit: 3 files at once.</div></div>', unsafe_allow_html=True)
 
+
+def render_login():
+    render_nav()
+    st.markdown('<section class="section"><div class="section-title">Sign in to your workspace.</div><div class="section-sub">Access your projects, previous reports, and document review workspace.</div></section>', unsafe_allow_html=True)
+    left, right = st.columns([0.52, 0.48], gap="large")
+    with left:
+        with st.form("login_form"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Sign In")
+            if submitted:
+                ok, user, msg = authenticate_user(email, password)
+                if ok:
+                    st.session_state.auth_user = user
+                    st.success(msg)
+                    target = st.session_state.get("after_login", "workspace")
+                    go(target)
+                else:
+                    st.error(msg)
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Create Account"):
+                go("signup")
+        with c2:
+            if st.button("Forgot Password"):
+                go("forgot")
+    with right:
+        st.markdown(
+            """
+<div class="security-box">
+<div class="card-title">Private Business Centre</div>
+<div class="card-text">
+In the enterprise version, each employee works inside a user-isolated workspace. Documents and reports are tied to a user and project, with password hashing, HTTPS upload flow, and configurable retention policies.
+</div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+
+def render_forgot():
+    render_nav()
+    st.markdown('<section class="section"><div class="section-title">Forgot password.</div><div class="section-sub">This is a demo placeholder. In production, this would send a secure reset link or OTP to the registered email.</div></section>', unsafe_allow_html=True)
+    email = st.text_input("Enter registered email")
+    if st.button("Send Reset Link"):
+        st.info("Demo mode: password reset email is not enabled yet. This placeholder shows the planned SaaS flow.")
+    if st.button("Back to Sign In"):
+        go("login")
+
+
+def render_workspace():
+    render_nav()
+    user = current_user()
+    if not user:
+        require_login("workspace")
+        return
+
+    stats = get_user_stats(user["id"])
+    projects = get_projects(user["id"])
+    if projects and not st.session_state.get("active_project_id"):
+        st.session_state.active_project_id = projects[0]["id"]
+
+    st.markdown(
+        f'<section class="section"><div class="section-title">My Workspace</div><div class="section-sub">Welcome, {html.escape(user["name"])}. Create projects, upload documents, generate reports, and access report history.</div></section>',
+        unsafe_allow_html=True,
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.markdown(f'<div class="metric"><div class="metric-label">Projects</div><div class="metric-value">{stats["projects"]}</div></div>', unsafe_allow_html=True)
+    with m2:
+        st.markdown(f'<div class="metric"><div class="metric-label">Reports</div><div class="metric-value">{stats["reports"]}</div></div>', unsafe_allow_html=True)
+    with m3:
+        st.markdown(f'<div class="metric"><div class="metric-label">Documents</div><div class="metric-value">{stats["documents"]}</div></div>', unsafe_allow_html=True)
+    with m4:
+        groq_value = "Ready" if get_api_key() else "Missing"
+        st.markdown(f'<div class="metric"><div class="metric-label">Groq API</div><div class="metric-value">{groq_value}</div></div>', unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    left, right = st.columns([0.34, 0.66], gap="large")
+
+    with left:
+        st.markdown('<div class="panel"><div class="panel-title">Create New Project</div><div class="panel-caption">Group documents by deal, company, client, or review purpose.</div></div>', unsafe_allow_html=True)
+        with st.form("project_form"):
+            project_name = st.text_input("Project name", placeholder="Example: ABC Acquisition")
+            project_type = st.selectbox("Project type", ["Due Diligence", "Financial Health", "Investment Memo", "Compliance Review", "Risk Assessment", "Custom Analysis"])
+            submitted = st.form_submit_button("Create Project")
+            if submitted:
+                ok, msg, project_id = create_project(user["id"], project_name, project_type)
+                if ok:
+                    st.session_state.active_project_id = project_id
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+        projects = get_projects(user["id"])
+        if projects:
+            project_options = {f'{p["project_name"]} — {p["project_type"]}': p["id"] for p in projects}
+            labels = list(project_options.keys())
+            current_label = labels[0]
+            for label, pid in project_options.items():
+                if pid == st.session_state.get("active_project_id"):
+                    current_label = label
+                    break
+            selected = st.selectbox("Active project", labels, index=labels.index(current_label))
+            st.session_state.active_project_id = project_options[selected]
+        else:
+            st.info("Create your first project to enable document upload.")
+
+        if st.button("View Previous Reports"):
+            go("reports")
+
+        st.markdown(
+            """
+<div class="privacy-note">
+<b>Privacy reminder:</b><br>
+This public demo is for public or non-confidential PDFs only. For confidential business documents, use a private deployment with user-isolated storage, audit logs, retention policy, and private LLM/vector database options.
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+    with right:
+        active_project = get_project(st.session_state.get("active_project_id"))
+        if not active_project:
+            st.markdown('<div class="panel"><div class="panel-title">Upload Documents</div><div class="panel-caption">Create a project first. Then upload PDFs inside that project.</div></div>', unsafe_allow_html=True)
+            return
+
+        stored_docs = get_project_documents(active_project["id"], user["id"])
+        doc_tree = ""
+        if stored_docs:
+            doc_lines = "<br>".join([f"├── {html.escape(d['file_name'])} ({int(d.get('page_count') or 0)} pages)" for d in stored_docs[:8]])
+            doc_tree = f"<br><br><b>Saved document history:</b><br>{doc_lines}"
+        st.markdown(
+            f'<div class="panel"><div class="panel-title">Project: {html.escape(active_project["project_name"])}</div><div class="panel-caption">Type: {html.escape(active_project["project_type"])}. Upload documents inside this project, like Annual Report, Audit Report, Balance Sheet. Current plan: {html.escape(user["plan"])}. Free limit: 5 PDFs. Pro and Enterprise: unlimited PDFs.{doc_tree}</div></div>',
+            unsafe_allow_html=True,
+        )
+        safe_to_upload = st.checkbox("I confirm these documents are public or non-confidential and suitable for demo processing.")
         uploaded_files = []
         if safe_to_upload:
             uploaded_files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True, label_visibility="collapsed")
         else:
             st.info("Confirm the safety checkbox to enable upload.")
 
-    with right_col:
         if not uploaded_files:
             st.markdown(
                 """
 <div class="panel">
-<div class="panel-title">3. Generate a Due Diligence Report</div>
-<div class="panel-caption">Once your documents are uploaded, LedgerLens will build the RAG index and generate a professional report.</div>
+<div class="panel-title">Generate a Due Diligence Report</div>
+<div class="panel-caption">After upload, LedgerLens will build a FAISS index, retrieve relevant evidence, and generate a structured report.</div>
 <div class="grid3">
-<div class="card"><div class="card-title">Executive Review</div><div class="card-text">Summary, key findings, risk level, and final view.</div></div>
-<div class="card"><div class="card-title">Risk Review</div><div class="card-text">Risks, red flags, severity, and business impact.</div></div>
-<div class="card"><div class="card-title">Custom Prompt</div><div class="card-text">Ask any due diligence question in plain language.</div></div>
+<div class="card"><div class="card-title">Due Diligence</div><div class="card-text">Executive summary, key findings, source evidence.</div></div>
+<div class="card"><div class="card-title">Risk Assessment</div><div class="card-text">Risks, red flags, severity, and business impact.</div></div>
+<div class="card"><div class="card-title">Investment Memo</div><div class="card-text">Business signals and follow-up questions.</div></div>
 </div>
 </div>
 """,
                 unsafe_allow_html=True,
             )
-            if not get_api_key():
-                st.markdown('<div class="key-warning"><b>Groq API key not detected.</b><br>Add <code>GROQ_API_KEY=gsk_your_actual_key_here</code> in your <code>.env</code>, save, stop Streamlit, and run again.</div>', unsafe_allow_html=True)
+            return
 
-        elif len(uploaded_files) > 3:
+        upload_limit = plan_upload_limit(user.get("plan", "Free"))
+        if upload_limit is not None and len(uploaded_files) > upload_limit:
             st.markdown(
-                """
+                f"""
 <div class="pro-lock">
 <h3>Pro Plan Required</h3>
-The free demo supports up to <b>3 PDFs</b> at once. You uploaded more than 3 files.
-<br><br><b>Pro workflow includes:</b>
-<br>⭐ More than 3 PDFs at once
-<br>⭐ Branded downloadable reports
-<br>⭐ Saved analysis history
-<br><br>Please remove extra files and keep only 3 PDFs for the free demo.
+Your current <b>{html.escape(user.get('plan', 'Free'))}</b> plan supports up to <b>{upload_limit} PDFs</b> at once.
+<br><br>Upgrade to <b>Pro ₹99/month</b> or <b>Enterprise ₹299/month</b> for unlimited uploads and premium features.
 </div>
 """,
                 unsafe_allow_html=True,
             )
+            return
 
+        with st.spinner("Reading documents, creating chunks, and building the FAISS index..."):
+            all_chunks: List[Dict] = []
+            combined_text = ""
+            total_pages = 0
+            doc_names = []
+            doc_meta = []
+            for file in uploaded_files:
+                doc_text, page_count, doc_chunks = extract_pdf_chunks(file)
+                combined_text += "\n" + doc_text
+                total_pages += page_count
+                all_chunks.extend(doc_chunks)
+                doc_names.append(file.name)
+                doc_meta.append({"file_name": file.name, "page_count": page_count})
+            save_project_documents(user["id"], active_project["id"], doc_meta)
+
+            if not all_chunks:
+                st.error("Could not extract readable text. Try text-based PDFs, not scanned image PDFs.")
+                st.stop()
+
+            index = build_faiss_index(all_chunks)
+            risk_label, risk_score = estimate_risk_signal(combined_text)
+
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.markdown(f'<div class="metric"><div class="metric-label">Documents</div><div class="metric-value">{len(uploaded_files)}</div></div>', unsafe_allow_html=True)
+        with m2:
+            st.markdown(f'<div class="metric"><div class="metric-label">Pages</div><div class="metric-value">{total_pages}</div></div>', unsafe_allow_html=True)
+        with m3:
+            st.markdown(f'<div class="metric"><div class="metric-label">Risk Signal</div><div class="metric-value">{risk_label}</div></div>', unsafe_allow_html=True)
+        with m4:
+            st.markdown(f'<div class="metric"><div class="metric-label">Project</div><div class="metric-value">#{active_project["id"]}</div></div>', unsafe_allow_html=True)
+
+        if not get_api_key():
+            st.markdown('<div class="key-warning"><b>Groq API key missing.</b><br>Report generation requires GROQ_API_KEY in Hugging Face secrets or local .env.</div>', unsafe_allow_html=True)
+
+        review_type = st.selectbox(
+            "Analysis type",
+            [
+                "Due Diligence",
+                "Financial Health",
+                "Investment Memo",
+                "Compliance Review",
+                "Risk Assessment",
+                "Custom Analysis",
+            ],
+        )
+        report_depth = st.selectbox("Report depth", ["Executive", "Standard", "Detailed"], index=1)
+        target_pages = st.selectbox("Target report pages", ["10 pages", "40 pages", "80 pages", "120 pages", "Custom"], index=0)
+        if target_pages == "Custom":
+            custom_pages = st.number_input("Custom target pages", min_value=1, max_value=150, value=15, step=1)
+            target_pages_value = f"{int(custom_pages)} pages"
         else:
-            with st.spinner("Reading documents, creating chunks, and building the FAISS index..."):
-                all_chunks: List[Dict] = []
-                combined_text = ""
-                total_pages = 0
-                doc_names = []
-                for file in uploaded_files:
-                    doc_text, page_count, doc_chunks = extract_pdf_chunks(file)
-                    combined_text += "\n" + doc_text
-                    total_pages += page_count
-                    all_chunks.extend(doc_chunks)
-                    doc_names.append(file.name)
+            target_pages_value = target_pages
+        audience = st.selectbox("Audience", ["Investor", "CFO", "Analyst", "Auditor", "Management Team"], index=2)
+        prompt_goal = st.selectbox(
+            "Prompt engine helper",
+            [
+                "Auto-generate a professional prompt",
+                "Focus on risks and red flags",
+                "Focus on financial health",
+                "Focus on investment decision",
+                "Focus on compliance/audit",
+                "I will write my own prompt",
+            ],
+        )
+        suggested_prompt_map = {
+            "Auto-generate a professional prompt": f"Prepare a {report_depth.lower()} {review_type.lower()} report of around {target_pages_value} for a {audience.lower()}. Include executive summary, key findings, risks, financial/operational signals, growth opportunities, recommendations, and source citations for every major finding.",
+            "Focus on risks and red flags": f"Prepare a risk-focused {review_type.lower()} report of around {target_pages_value} for a {audience.lower()}. Identify red flags, severity, business impact, missing information, and follow-up questions with source citations.",
+            "Focus on financial health": f"Prepare a financial health review of around {target_pages_value} for a {audience.lower()}. Focus on revenue, cost, profitability, liquidity, debt, cash-flow indicators, operating signals, and source citations.",
+            "Focus on investment decision": f"Prepare an investment memo of around {target_pages_value} for a {audience.lower()}. Cover investment thesis, strengths, risks, diligence questions, and recommendation-oriented insights with citations.",
+            "Focus on compliance/audit": f"Prepare a compliance and audit review of around {target_pages_value} for a {audience.lower()}. Cover governance, disclosures, controls, regulatory risks, audit issues, missing information, and source citations.",
+            "I will write my own prompt": "",
+        }
+        user_prompt = st.text_area(
+            "Analysis request",
+            value=suggested_prompt_map[prompt_goal],
+            height=135,
+            placeholder="Example: Identify risks, red flags, key findings, and recommended follow-up questions.",
+        )
+        st.caption("LedgerLens uses a section-wise report engine. Larger page targets generate deeper sections, evidence registers, and longer downloadable reports. Exact page count can vary based on available document evidence and API limits.")
 
-                if not all_chunks:
-                    st.error("Could not extract readable text. Try text-based PDFs, not scanned image PDFs.")
-                    st.stop()
+        if st.button("Generate LedgerLens Report"):
+            if not user_prompt.strip():
+                st.warning("Please enter an analysis request.")
+            else:
+                mode = "standard"
+                if "Risk" in review_type:
+                    mode = "risk"
+                elif "Compliance" in review_type:
+                    mode = "compliance"
+                elif "Financial" in review_type:
+                    mode = "financial"
+                elif "Investment" in review_type:
+                    mode = "memo"
+                elif "Custom" in review_type:
+                    mode = "custom"
 
-                index = build_faiss_index(all_chunks)
-                risk_label, risk_score = estimate_risk_signal(combined_text)
+                final_question = f"Project: {active_project['project_name']} | Type: {review_type} | Depth: {report_depth} | Target Pages: {target_pages_value} | Audience: {audience} | Request: {user_prompt.strip()}"
+                with st.spinner("LedgerLens is generating a section-wise professional report with citations..."):
+                    answer, relevant_chunks = generate_sectioned_report(
+                        final_question=final_question,
+                        all_chunks=all_chunks,
+                        index=index,
+                        review_type=review_type,
+                        report_depth=report_depth,
+                        target_pages_value=target_pages_value,
+                        audience=audience,
+                        mode=mode,
+                    )
 
-            m1, m2, m3, m4 = st.columns(4)
-            with m1:
-                st.markdown(f'<div class="metric"><div class="metric-label">Documents</div><div class="metric-value">{len(uploaded_files)}</div></div>', unsafe_allow_html=True)
-            with m2:
-                st.markdown(f'<div class="metric"><div class="metric-label">Pages</div><div class="metric-value">{total_pages}</div></div>', unsafe_allow_html=True)
-            with m3:
-                st.markdown(f'<div class="metric"><div class="metric-label">Risk Signal</div><div class="metric-value">{risk_label}</div></div>', unsafe_allow_html=True)
-            with m4:
-                groq_value = "Ready" if get_api_key() else "Missing"
-                st.markdown(f'<div class="metric"><div class="metric-label">Groq API</div><div class="metric-value">{groq_value}</div></div>', unsafe_allow_html=True)
+                report_text = build_txt_report(final_question, answer, relevant_chunks, doc_names)
+                report_title = f"{active_project['project_name']} - {review_type}"
+                report_id = save_report(user["id"], active_project["id"], report_title, review_type, report_text)
 
-            if not get_api_key():
-                st.markdown('<div class="key-warning"><b>Groq API key missing.</b><br>Your document upload and FAISS index are working, but report generation requires your key in <code>.env</code>.</div>', unsafe_allow_html=True)
+                st.session_state.report_ready = True
+                st.session_state.latest_question = final_question
+                st.session_state.latest_answer = answer
+                st.session_state.latest_sources = relevant_chunks
+                st.session_state.latest_doc_names = doc_names
+                st.session_state.latest_report_id = report_id
+                st.session_state.latest_metrics = {
+                    "documents": len(uploaded_files),
+                    "pages": total_pages,
+                    "risk": risk_label,
+                    "evidence": len(relevant_chunks),
+                    "review_type": review_type,
+                }
+                st.session_state.share_summary = "\n".join(generate_summary_points(answer))
+                go("report")
 
-            review_type = st.selectbox(
-                "Review type",
-                [
-                    "Executive Due Diligence Report",
-                    "Risk and Red Flag Review",
-                    "Growth Opportunity Review",
-                    "Compare Uploaded Documents",
-                    "Custom Due Diligence Question",
-                ],
-            )
-            user_prompt = st.text_area(
-                "Due diligence request",
-                value="Prepare a proper due diligence report.",
-                height=110,
-                placeholder="Example: Identify risks, red flags, key findings, and recommended follow-up questions.",
-            )
-
-            if st.button("Generate LedgerLens Report"):
-                if not user_prompt.strip():
-                    st.warning("Please enter a due diligence request.")
-                else:
-                    mode = "standard"
-                    if "Risk" in review_type:
-                        mode = "risk"
-                    elif "Growth" in review_type:
-                        mode = "growth"
-                    elif "Compare" in review_type:
-                        mode = "compare"
-
-                    final_question = f"{review_type}: {user_prompt.strip()}"
-                    with st.spinner("Retrieving evidence and generating a professional due diligence report..."):
-                        relevant_chunks = retrieve_relevant_chunks(final_question, all_chunks, index, top_k=7)
-                        answer = ask_groq(final_question, relevant_chunks, mode=mode)
-
-                    st.session_state.report_ready = True
-                    st.session_state.latest_question = final_question
-                    st.session_state.latest_answer = answer
-                    st.session_state.latest_sources = relevant_chunks
-                    st.session_state.latest_doc_names = doc_names
-                    st.session_state.latest_metrics = {
-                        "documents": len(uploaded_files),
-                        "pages": total_pages,
-                        "risk": risk_label,
-                        "evidence": len(relevant_chunks),
-                        "review_type": review_type,
-                    }
-                    st.session_state.share_summary = "\n".join(generate_summary_points(answer))
-                    go("report")
-    st.markdown("</div>", unsafe_allow_html=True)
 
 def render_report():
     render_nav()
+    if not current_user():
+        require_login("report")
+        return
     if not st.session_state.get("report_ready"):
         st.warning("No report has been generated yet.")
         if st.button("Go to Workspace"):
@@ -1223,15 +2205,38 @@ def render_report():
 
     with right:
         st.markdown('<div class="share-box">', unsafe_allow_html=True)
+        st.markdown("### Review LedgerLens")
+        st.caption("Before downloading, please rate the generated report. This helps improve LedgerLens.")
+        rating = st.select_slider("Rate your report experience", options=[1, 2, 3, 4, 5], value=5, format_func=lambda x: "⭐" * x, key="review_rating_top")
+        review_text = st.text_area("Write a short review", placeholder="Example: The source citations helped me trust the report.", height=90, key="review_text_top")
+        if st.button("Submit Review", key="submit_review_top"):
+            save_review(current_user()["id"], st.session_state.get("latest_report_id"), int(rating), review_text)
+            st.success("Thank you. Your review was saved in the database.")
+        st.markdown("---")
         st.markdown("### Download Report")
         st.download_button("Download PDF Report", data=pdf_bytes, file_name="ledgerlens_due_diligence_report.pdf", mime="application/pdf")
         st.download_button("Download TXT Report", data=report_text, file_name="ledgerlens_due_diligence_report.txt", mime="text/plain")
 
-        st.markdown("### Share Options")
-        summary_for_share = st.session_state.share_summary[:1200]
-        mail_body = re.sub(r"\s+", "%20", summary_for_share)
-        st.markdown(f'<a class="contact-btn" href="mailto:?subject=LedgerLens%20Due%20Diligence%20Report&body={mail_body}">Share by Email</a>', unsafe_allow_html=True)
-        st.text_area("Copy summary", value=summary_for_share, height=170)
+        st.markdown("### Saved to Workspace")
+        rid = st.session_state.get("latest_report_id")
+        st.success(f"Report saved in Previous Reports. Report ID: {rid}")
+        if st.button("Open Previous Reports"):
+            go("reports")
+
+
+        st.markdown("### Email Delivery")
+        recipient_email = st.text_input("Send report to email", value=current_user().get("email", "") if current_user() else "")
+        email_summary = f"LedgerLens report generated. Report ID: {rid}. Download the PDF from your LedgerLens workspace.\n\nSummary:\n{st.session_state.get('share_summary', '')[:900]}"
+        mail_link = "mailto:" + quote(recipient_email or "") + "?subject=" + quote("LedgerLens Due Diligence Report") + "&body=" + quote(email_summary)
+        st.markdown(f'<a class="contact-btn email-btn" href="{mail_link}">Open Email Draft</a>', unsafe_allow_html=True)
+        if st.button("Send Email Now"):
+            ok, message = send_email_optional(current_user()["id"], recipient_email, "LedgerLens Due Diligence Report", email_summary)
+            log_activity(current_user()["id"], f"Email delivery attempted for report #{rid}: {message}")
+            if ok:
+                st.success("Email sent successfully.")
+            else:
+                st.warning(message + " Add SMTP_USER and SMTP_PASSWORD secrets to send real email automatically.")
+        st.caption("Email works automatically only after SMTP secrets are added in Hugging Face. The Open Email Draft button works without SMTP.")
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown('<section class="section"><div class="section-title">Retrieved Source Evidence</div></section>', unsafe_allow_html=True)
@@ -1247,6 +2252,162 @@ def render_report():
             unsafe_allow_html=True,
         )
 
+
+def render_reports():
+    render_nav()
+    user = current_user()
+    if not user:
+        require_login("reports")
+        return
+    st.markdown('<section class="section"><div class="section-title">Previous Reports</div><div class="section-sub">All reports generated from your logged-in workspace are saved here.</div></section>', unsafe_allow_html=True)
+    reports = get_reports(user["id"])
+    if not reports:
+        st.info("No reports generated yet. Create a project and generate your first report from Workspace.")
+        if st.button("Go to Workspace"):
+            go("workspace")
+        return
+    for r in reports:
+        title = f'{r["report_title"]} — {r["created_at"]}'
+        with st.expander(title, expanded=False):
+            st.caption(f'Project: {r.get("project_name") or "No project"} | Type: {r["report_type"]}')
+
+            edited_text = st.text_area(
+                "Edit saved report",
+                value=r["report_text"],
+                height=420,
+                key=f'edit_report_text_{r["id"]}',
+                help="You can edit the saved report text here and save the changes to your workspace history.",
+            )
+
+            save_col, dl1_col, dl2_col = st.columns([0.34, 0.33, 0.33])
+            with save_col:
+                if st.button("Save Edited Report", key=f'save_report_{r["id"]}'):
+                    if update_report(r["id"], user["id"], edited_text):
+                        st.success("Report updated and saved in your workspace.")
+                        st.rerun()
+                    else:
+                        st.error("Could not update this report. Please login again and retry.")
+            with dl1_col:
+                st.download_button(
+                    "Download Edited TXT",
+                    data=edited_text,
+                    file_name=f'ledgerlens_report_{r["id"]}_edited.txt',
+                    mime="text/plain",
+                    key=f'dl_txt_{r["id"]}',
+                )
+            with dl2_col:
+                st.download_button(
+                    "Download Edited PDF",
+                    data=make_pdf_bytes("LedgerLens Saved Report", edited_text),
+                    file_name=f'ledgerlens_report_{r["id"]}_edited.pdf',
+                    mime="application/pdf",
+                    key=f'dl_pdf_{r["id"]}',
+                )
+
+            saved_mail_body = quote(f"LedgerLens saved report: {r['report_title']}\nGenerated: {r['created_at']}\n\nPlease download the PDF from LedgerLens workspace.\n\n{edited_text[:900]}")
+            st.markdown(f'<a class="contact-btn email-btn" href="mailto:{quote(user["email"])}?subject={quote("LedgerLens Saved Report")}&body={saved_mail_body}">Email This Report</a>', unsafe_allow_html=True)
+
+
+def render_account():
+    render_nav()
+    user = current_user()
+    if not user:
+        require_login("account")
+        return
+    stats = get_user_stats(user["id"])
+    activity = get_activity(user["id"])
+    st.markdown('<section class="section"><div class="section-title">Account</div><div class="section-sub">Your LedgerLens profile, plan, and recent activity.</div></section>', unsafe_allow_html=True)
+    c1, c2 = st.columns([0.45, 0.55], gap="large")
+    with c1:
+        st.markdown(
+            f"""
+<div class="security-box">
+<div class="card-title">Profile</div>
+<div class="card-text">
+<b>Name:</b> {html.escape(user['name'])}<br>
+<b>Email:</b> {html.escape(user['email'])}<br>
+<b>Plan:</b> {html.escape(user['plan'])}<br>
+<b>Created:</b> {html.escape(user['created_at'])}<br><br>
+Passwords are stored using PBKDF2-SHA256 hashing in the demo SQLite database.
+</div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+    with c2:
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.markdown(f'<div class="metric"><div class="metric-label">Projects</div><div class="metric-value">{stats["projects"]}</div></div>', unsafe_allow_html=True)
+        with m2:
+            st.markdown(f'<div class="metric"><div class="metric-label">Documents</div><div class="metric-value">{stats["documents"]}</div></div>', unsafe_allow_html=True)
+        with m3:
+            st.markdown(f'<div class="metric"><div class="metric-label">Reports</div><div class="metric-value">{stats["reports"]}</div></div>', unsafe_allow_html=True)
+        st.markdown("### Recent Activity")
+        if not activity:
+            st.info("No activity yet.")
+        for item in activity:
+            st.markdown(f'<div class="source"><b>{html.escape(item["action"])}</b><br>{html.escape(item["created_at"])}</div>', unsafe_allow_html=True)
+
+
+def render_admin():
+    render_nav()
+    user = current_user()
+    if not is_admin(user):
+        st.error("Admin access required. Sign in with the admin email to view the database.")
+        return
+
+    st.markdown('<section class="section"><div class="section-title">Hidden Admin Backend</div><div class="section-sub">Backend-only database and plan management for LedgerLens. This page is not shown in the public navbar and is accessible only through the hidden admin URL after admin login.</div></section>', unsafe_allow_html=True)
+
+    counts = get_admin_counts()
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.markdown(f'<div class="metric"><div class="metric-label">Users</div><div class="metric-value">{counts["users"]}</div></div>', unsafe_allow_html=True)
+    with m2:
+        st.markdown(f'<div class="metric"><div class="metric-label">Projects</div><div class="metric-value">{counts["projects"]}</div></div>', unsafe_allow_html=True)
+    with m3:
+        st.markdown(f'<div class="metric"><div class="metric-label">Reports</div><div class="metric-value">{counts["reports"]}</div></div>', unsafe_allow_html=True)
+    with m4:
+        st.markdown(f'<div class="metric"><div class="metric-label">Reviews</div><div class="metric-value">{counts["reviews"]}</div></div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="section-title" style="font-size:1.4rem; margin-top:1.3rem;">Manual Plan Activation</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-sub">Use this only as demo/admin activation before integrating Razorpay or Stripe. It updates the user plan and records an admin_manual payment record.</div>', unsafe_allow_html=True)
+
+    user_rows = get_admin_table("users", limit=500)
+    if user_rows:
+        user_options = {
+            f"#{row['id']} — {row['name']} — {row['email']} — current: {row['plan']}": row["id"]
+            for row in user_rows
+        }
+        selected_user_label = st.selectbox("Select user to manage plan", list(user_options.keys()))
+        selected_user_id = user_options[selected_user_label]
+        selected_plan = st.radio("Set plan", ["Free", "Pro", "Enterprise"], horizontal=True)
+        c1, c2 = st.columns([0.25, 0.75])
+        with c1:
+            if st.button("Activate Selected Plan"):
+                ok = update_user_plan(selected_user_id, selected_plan, user.get("email", "admin"))
+                if ok:
+                    st.success(f"User plan updated to {selected_plan}. A payment/admin activation record was saved.")
+                    st.rerun()
+                else:
+                    st.error("Could not update the selected user plan.")
+        with c2:
+            st.markdown('<div class="privacy-note"><b>Plan logic:</b> Free = 5 PDFs. Pro ₹99/month = unlimited demo features. Enterprise ₹299/month = unlimited + enterprise label/security positioning. Real payment gateway is not active yet.</div>', unsafe_allow_html=True)
+    else:
+        st.info("No users found yet. Create a test account first.")
+
+    st.markdown('<div class="section-title" style="font-size:1.4rem; margin-top:1.3rem;">Database Tables</div>', unsafe_allow_html=True)
+    table_name = st.selectbox("Select database table", ["users", "login_events", "projects", "documents", "reports", "reviews", "payments", "activity"])
+    rows = get_admin_table(table_name, limit=100)
+    if rows:
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+    else:
+        st.info("No records found in this table yet.")
+
+    st.markdown(
+        '<div class="privacy-note"><b>Admin note:</b> This is a demo SQLite backend. On Hugging Face, the database lives inside the running Space environment and may reset after rebuilds unless persistent storage is added. For production, use PostgreSQL/Supabase/Firebase, secure file storage, real payment verification, RBAC, and audit logging.</div>',
+        unsafe_allow_html=True,
+    )
+
 def render_security():
     render_nav()
     if st.button("← Home"):
@@ -1254,15 +2415,21 @@ def render_security():
     st.markdown(
         """
 <section class="section">
-<div class="section-title">Security-first design for company documents.</div>
+<div class="section-title">Security and Private Business Centre.</div>
 <div class="section-sub">
-Business documents may contain confidential financial, operational, or legal information. LedgerLens uses a public demo mode for non-confidential files and defines a secure enterprise architecture for real company deployment.
+LedgerLens public demo is for public or non-confidential files. For real company use, the platform is designed around private workspaces, user-isolated projects, password hashing, audit logs, and private deployment options.
 </div>
 <div class="security-box">
 <div class="grid3">
-<div><div class="card-title">Public Demo Mode</div><div class="card-text">Use public annual reports, investor presentations, and non-confidential documents only. This version processes documents during the active session and does not intentionally store uploaded files in a database.</div></div>
-<div><div class="card-title">Private Business Mode</div><div class="card-text">For confidential company documents, LedgerLens should run in a private deployment with controlled access, encrypted storage, automatic file deletion, private vector indexing, and audit logs.</div></div>
-<div><div class="card-title">Private LLM Option</div><div class="card-text">For sensitive business data, the enterprise version can use a private LLM endpoint or local model inference so confidential content is not sent to a public third-party API.</div></div>
+<div><div class="card-title">Public Demo Mode</div><div class="card-text">Use public annual reports, investor presentations, and non-confidential documents only. The demo focuses on showcasing the workflow and should not be used for restricted company files.</div></div>
+<div><div class="card-title">Private Business Centre</div><div class="card-text">Employees sign in to private workspaces. Documents, projects, and reports are isolated by user ID and project ID, so one user cannot access another user's work by default.</div></div>
+<div><div class="card-title">Password Hashing</div><div class="card-text">The demo authentication stores password hashes, not raw passwords. Production systems should use stronger managed auth, MFA, and role-based access control.</div></div>
+</div>
+<br>
+<div class="grid3">
+<div><div class="card-title">No Model Training</div><div class="card-text">Uploaded files are used for requested analysis only. The intended enterprise policy is: user documents are not used to train AI models.</div></div>
+<div><div class="card-title">Retention Control</div><div class="card-text">A company deployment can support auto-delete after analysis, 7-day retention, 30-day retention, or permanent private workspace storage.</div></div>
+<div><div class="card-title">Private AI Stack</div><div class="card-text">For confidential use, LedgerLens can be deployed with a private vector database and private LLM endpoint such as a company-hosted model or enterprise cloud model.</div></div>
 </div>
 </div>
 </section>
@@ -1278,11 +2445,11 @@ def render_plans():
         """
 <section class="section">
 <div class="section-title">Plans for different review needs.</div>
-<div class="section-sub">The free demo keeps the core RAG workflow accessible. Pro and Enterprise are product roadmap concepts for business deployment.</div>
+<div class="section-sub">The free demo keeps the core RAG workflow accessible. Pro and Enterprise can be manually activated by admin in this MVP; real payment gateway integration is planned for production.</div>
 <div class="grid3">
 <div class="pricing popular">
-<div class="price-name">Free Demo</div><div class="price">₹0 <span>/ up to 3 PDFs</span></div>
-<div class="check">✅ Upload up to three non-confidential PDFs</div>
+<div class="price-name">Free Demo</div><div class="price">₹0 <span>/ up to 5 PDFs</span></div>
+<div class="check">✅ Upload up to five non-confidential PDFs</div>
 <div class="check">✅ Ask document questions</div>
 <div class="check">✅ Executive due diligence report</div>
 <div class="check">✅ Risk and growth review</div>
@@ -1290,13 +2457,16 @@ def render_plans():
 <div class="check">✅ Download PDF report</div>
 </div>
 <div class="pricing">
-<div class="price-name">Pro</div><div class="price">₹499 <span>/ future concept</span></div>
-<div class="check">⭐ More than 3 PDFs at once</div>
+<div class="price-name">Pro</div><div class="price">₹99 <span>/ month</span></div>
+<div class="check">⭐ More than 5 PDFs at once</div>
+<div class="check">⭐ Unlimited report generation</div>
 <div class="check">⭐ Branded downloadable reports</div>
 <div class="check">⭐ Saved analysis history</div>
+<div class="check">⭐ Longer reports and priority processing</div>
 </div>
 <div class="pricing">
-<div class="price-name">Enterprise</div><div class="price">Custom <span>/ secure deployment</span></div>
+<div class="price-name">Enterprise</div><div class="price">₹299 <span>/ month</span></div>
+<div class="check">🏢 Unlimited enterprise workspaces</div>
 <div class="check">🏢 Private company workspace</div>
 <div class="check">🏢 Role-based access control</div>
 <div class="check">🏢 Encrypted storage and audit logs</div>
@@ -1308,15 +2478,52 @@ def render_plans():
         unsafe_allow_html=True,
     )
 
+
+
+
+def render_assistant():
+    # Removed from navbar/workflow. LedgerLens focuses on professional due diligence reports.
+    go("home")
+
+
+def render_floating_help_panel():
+    # Removed in LedgerLens Report Engine edition. Focus stays on professional report generation.
+    return
+
+
+# =========================
+# HIDDEN ADMIN BACKEND ACCESS
+# =========================
+# Admin DB is not visible in the public navbar.
+# To open backend viewer, sign in with admin email and open:
+# https://sharvarid01-ledgerlens.hf.space/?backend=ledgerlens-admin
+try:
+    if st.query_params.get("backend") == "ledgerlens-admin":
+        st.session_state.page = "admin"
+except Exception:
+    pass
+
 # =========================
 # ROUTER
 # =========================
 if st.session_state.page == "home":
     render_home()
+elif st.session_state.page == "signup":
+    render_signup()
+elif st.session_state.page == "login":
+    render_login()
+elif st.session_state.page == "forgot":
+    render_forgot()
 elif st.session_state.page == "workspace":
     render_workspace()
 elif st.session_state.page == "report":
     render_report()
+elif st.session_state.page == "reports":
+    render_reports()
+elif st.session_state.page == "account":
+    render_account()
+elif st.session_state.page == "admin":
+    render_admin()
 elif st.session_state.page == "security":
     render_security()
 elif st.session_state.page == "plans":
